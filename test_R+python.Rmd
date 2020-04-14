@@ -1,0 +1,204 @@
+---
+title: "R+python = ♥︎"
+output: 
+  html_document: 
+    css: ~/gdrive/code/niceCSS/document.css
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  cache=TRUE,
+  echo=TRUE, eval=TRUE,
+  comment="",
+  fig.width=7.5, fig.height=4.5
+)
+library("tidyverse")
+library("reticulate")
+```
+
+
+## Read and prepare data
+
+```{r read}
+d <- read_csv("features_JO.csv", col_types=cols())
+l <- read_csv("labels_JO.csv", col_types=cols())
+d[,1] <- as.factor(l$label)
+d <- rename(d,label=X1)
+rm(l)
+
+
+dd <- d %>% group_by(label) %>% sample_frac(0.5)
+
+
+library(FactoMineR)
+x <- PCA(dd[,-1], graph=F, ncp=50)
+xx <- x$ind$coord
+ddd <- data.frame(label=dd$label, xx)
+
+
+write_csv(ddd, "data.csv.gz")
+d <- ddd
+```
+
+Make stratified learn vs test split
+
+```{r split}
+set.seed(1)
+# 80% learn (used with cross-validation), 20% test
+d <- d %>% group_by(label) %>% mutate(set=ifelse(runif(n())>0.8, "test", "learn")) %>% ungroup()
+
+# # or
+# # 70% train, 15% valid, 15% test
+# d <- d %>% group_by(label) %>% mutate(
+#     r=runif(n()),
+#     set=case_when(
+#       r>=0.7 & r<0.85 ~ "valid",
+#       r>=0.85 ~ "test",
+#       TRUE ~ "train")
+#   ) %>% ungroup()
+
+# compute number of objects, to check
+count(d, label, set) %>% spread(key="set", value="n")
+
+# prepare matrices for each set for further functions
+X <- select(d, -label, -set) %>% as.matrix()
+y <- d$label
+
+dl <- filter(d, set=="learn") %>% select(-set)
+Xl <- select(dl, -label) %>% as.matrix()
+yl <- dl$label
+
+dt <- filter(d, set=="test") %>% select(-set)
+Xt <- select(dt, -label) %>% as.matrix()
+yt <- dt$label
+```
+
+## Optimise and train RF model in R
+
+From various sources, it appears that the number of trees is not an hyperparamter to be tuned for Random Forests: just pick a large one and tune the rest.
+
+Still, in terms of time taken for prediction, it makes sense to limit the number of trees; but this can be done afterwards.
+
+```{r r_RF_cv}
+library("caret")
+library("ranger")
+library("MLmetrics")
+
+# define a grid of hyperparameters to tune
+grid <- crossing(
+    mtry=c(5, 7, 9),         # number of variables per node; default sqrt(nb of vars) = 7
+    min.node.size=c(2,5,10), # min number of objects in leaf; default for classif = 5
+    splitrule="gini"
+  ) %>% as.data.frame()
+
+# tune hyperparameters on grid, using 4-fold cross-validation
+system.time(mcv <- train(
+  x=Xl, y=yl,
+  method="ranger",
+  num.trees=200, # large enough number of trees
+  tuneGrid=grid,
+  trControl=trainControl(method="cv", number=4), # 4-fold cross validation
+  num.threads=12,
+  verbose=T
+  )
+)
+# plot result
+ggplot(mcv)
+```
+
+Overall, little sensitivity to choices (cf y scale). Let's take the usual `min.node.size` for classif=5, and use `mtry`=7 then.
+
+```{r r_RF_fit}
+# re-fit the model the best parameters and for many trees
+m <- ranger(label ~ ., data=dl, num.trees=300, mtry=7, min.node.size=5, num.threads=12)
+
+# evaluate accuracy on test-set for increasing number of trees
+# this is not really tuning: if we had enough time, we would go all the way to 300;
+# so it's kind of OK to do it on the test set
+trees <- 1:300
+accur <- sapply(trees, function(n) {
+  Accuracy(predict(m, data=Xt, num.trees=n, num.threads=12)$predictions, yt)
+})
+pred_res <- data.frame(trees, accur)
+ggplot(pred_res) + geom_path(aes(trees, accur))
+```
+
+200 trees seems to be a good solution.
+
+
+## Optimise and train RF in python
+
+```{python py_RF_cv}
+from sklearn.model_selection import GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+import time
+
+rf = RandomForestClassifier(n_estimators=200, criterion='gini', min_samples_split=2)
+# NB: set a small min_sample_split to make sure it is min_sample_leaf which determines the depth of the tree.
+
+grid = {'max_features': [5,7,9], 'min_samples_leaf': [2,5,10]}
+
+mcv = GridSearchCV(rf, param_grid=grid, cv=4, n_jobs=12, scoring='accuracy')
+tic = time.perf_counter()
+mcv.fit(X=r.Xl, y=r.yl)
+# NB objects from R land can be accessed with r.***
+toc = time.perf_counter()
+print(f"CV-fit in {toc - tic:0.1f} s")
+# NB: access r objects with r.***
+```
+
+Faster grid search! Now let's look at the results.
+
+```{r py_RF_cv_plot}
+# get results into a data.frame
+# NB: objects from python land can be accessed with py$***
+cv_res <- data.frame(
+  max_features=py$mcv$cv_results_$param_max_features %>% unlist(),
+  min_samples_leaf=py$mcv$cv_results_$param_min_samples_leaf %>% unlist() %>% as.factor(),
+  mean_valid_accur=py$mcv$cv_results_$mean_test_score,
+  std_valid_accur=py$mcv$cv_results_$std_test_score
+)
+# and plot it
+ggplot(cv_res) +
+  geom_pointrange(aes(x=max_features,
+    y=mean_valid_accur, colour=min_samples_leaf,
+    ymin=mean_valid_accur-std_valid_accur, ymax=mean_valid_accur+std_valid_accur),
+    position=position_dodge(width=1)
+  )
+```
+
+Similar results. Let us refit the model as before.
+
+```{python py_RF_fit}
+from sklearn.metrics import accuracy_score
+import numpy as np
+import pandas as pd
+
+# refit model with best parameters
+rf = RandomForestClassifier(n_estimators=0, criterion='gini', min_samples_split=2, min_samples_leaf=5, max_features=7, warm_start=True)
+# NB: use the same parameters as above even though max_features=35 seems better
+
+# evaluate it on test set for a range of number of trees
+trees = range(1, 300)
+accur = np.full(300-1, np.nan)
+for n in trees:
+  rf.n_estimators = n
+  rf = rf.fit(X=r.Xl, y=r.yl)
+  accur[n-1] = accuracy_score(r.yt, rf.predict(r.Xt))
+
+pred_res = pd.DataFrame.from_dict({'trees': trees, 'accur': accur})
+```
+
+```{r py_RF_fit_plot}
+ggplot(py$pred_res) + geom_path(aes(trees, accur))
+```
+
+In that implementation, the results seem to converge faster and 50 may be enough. There may be a small bump after 150 though, where we gain ~0.3% accuracy.
+
+```{r py_RF_fit_plo2}
+ggplot(py$pred_res) + geom_path(aes(trees, accur)) + ylim(0.78, 0.82)
+```
