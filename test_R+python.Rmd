@@ -32,17 +32,29 @@ Make stratified learn vs test split
 ```{r split}
 set.seed(1)
 # 80% learn (used with cross-validation), 20% test
-d <- d %>% group_by(label) %>% mutate(set=ifelse(runif(n())>0.8, "test", "learn")) %>% ungroup()
+d <- d %>% group_by(label) %>%
+  # shuffle rows
+  sample_frac(1) %>% 
+  # take the first 80% of rows as learning set, rest as test
+  mutate(set=ifelse((1:n())/n() <= 0.8, "learn", "test")) %>% 
+  ungroup()
 
 # # or
 # # 70% train, 15% valid, 15% test
-# d <- d %>% group_by(label) %>% mutate(
-#     r=runif(n()),
+# d <- d %>% group_by(label) %>%
+#   # shuffle rows
+#   sample_frac(1) %>%
+#   mutate(
+#     # percent rank (which is random)
+#     r=(1:n()) / n(),
+#     # assign in set based in this
 #     set=case_when(
 #       r>=0.7 & r<0.85 ~ "valid",
 #       r>=0.85 ~ "test",
-#       TRUE ~ "train")
-#   ) %>% ungroup()
+#       TRUE ~ "train"
+#     )
+#   ) %>% select(-r) %>%
+#   ungroup()
 
 # compute number of objects, to check
 count(d, label, set) %>% spread(key="set", value="n")
